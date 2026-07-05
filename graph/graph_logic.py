@@ -11,14 +11,12 @@ from langchain_core.messages import BaseMessage, HumanMessage
 
 from LLMs.gemini_llm import llm
 from tools.main import weather_api
-
+from mcp import ClientSession
+import json
+import asyncio
+from mcp.client.streamable_http import streamable_http_client
 
 client = llm
-
-weather_llm = llm.bind_tools(
-    [weather_api],
-    tool_choice="weather_api",
-)
 
 
 # ==============================
@@ -60,6 +58,8 @@ class GraphState(TypedDict):
     itinerary: str
 
     results: Dict[str, Any]
+    
+    change: str
 
 
 # ==============================
@@ -208,6 +208,7 @@ def apply_extracted_fields(state: GraphState, extracted: Dict[str, Any]):
 # PLANNER LLM
 # ==============================
 def planner_llm(state: GraphState, latest_input: str) -> Dict[str, str]:
+    
     prompt = f"""
 You are the Planner / Orchestrator Agent.
 
@@ -227,11 +228,22 @@ Your job:
 4. If enough information exists, decide the route.
 5. If user wants final itinerary, route must be I,END.
 6. For normal planning/replanning, route must end with P.
-7. Return ONLY this format:
+7. If the latest user input asks to CHANGE something already set (destination, budget, dates, duration, etc.),
+   identify which agent(s) own that data and route ONLY to those agents (ending in P), and describe the
+   specific change in the CHANGE field so that agent knows exactly what to update.
+8. Return ONLY this format:
 
 ACTION: ASK or ROUTE
 QUESTION:
 ROUTE:
+CHANGE:
+
+Field rules:
+- QUESTION: filled only when ACTION is ASK. Otherwise leave blank.
+- ROUTE: comma-separated agent codes in execution order. Filled only when ACTION is ROUTE.
+- CHANGE: filled only when the user is modifying previously known information. State plainly what
+  changed and what the responsible agent should do (e.g. "Update budget to ₹50,000 total, re-run cost
+  estimate for existing itinerary"). Leave blank if this is a fresh planning step, not a change.
 
 Known state:
 Destination: {state["destination"]}
@@ -253,25 +265,43 @@ Latest user input:
 {latest_input}
 
 Examples:
+
 ACTION: ASK
 QUESTION: What is your budget and trip duration?
 ROUTE:
+CHANGE:
 
 ACTION: ROUTE
 QUESTION:
 ROUTE: D,W,T,B,P
+CHANGE:
 
 ACTION: ROUTE
 QUESTION:
 ROUTE: I,END
-"""
+CHANGE:
 
+ACTION: ROUTE
+QUESTION:
+ROUTE: B,P
+CHANGE: User wants to reduce budget from ₹80,000 to ₹50,000 total. Budget Agent should recompute
+cost breakdown and flag any itinerary items that no longer fit.
+
+ACTION: ROUTE
+QUESTION:
+ROUTE: D,T,B,P
+CHANGE: User wants to change destination from Manali to Rishikesh. Destination Agent should refetch
+experiences/attractions, Transport Agent should recompute distance and travel options from source city,
+Budget Agent should re-estimate costs for the new destination.
+"""
+    
     text = call_llm(prompt)
 
     return {
         "action": get_value(text, "ACTION").upper(),
         "question": get_value(text, "QUESTION"),
         "route": get_value(text, "ROUTE"),
+        "change": get_value(text, "CHANGE") or ""
     }
 
 
@@ -322,6 +352,8 @@ def planner_node(state: GraphState):
             **state,
             "plan": new_plan,
             "current_step": 0,
+            "change":decision["change"]
+            
         }
 
     question_decision = planner_llm(
@@ -377,6 +409,7 @@ Do not give route. Only ask the question.
         **state,
         "plan": new_plan,
         "current_step": 0,
+        "change":decision["change"] or ""
     }
 
 
@@ -402,22 +435,6 @@ def route_next(state: GraphState):
     print(f"[Router] Next Step: {next_agent}")
 
     return next_agent
-
-
-def route_after_weather_agent(state: GraphState):
-    if not state["messages"]:
-        print("[Weather Router] No messages found.")
-        return END
-
-    last_message = state["messages"][-1]
-
-    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        print("[Weather Router] Tool call found. Going to WEATHER_TOOL.")
-        return "WEATHER_TOOL"
-
-    print("[Weather Router] No tool call found. Ending.")
-    return END
-
 
 # ==============================
 # DESTINATION AGENT
@@ -445,8 +462,24 @@ Dates: {state["dates"]}
 Travelers: {state["travelers"]}
 Travel style: {state["travel_style"]}
 Existing results: {state["results"]}
-"""
 
+Planner change instruction (if any):
+{state.get("change", "")}
+
+Rules:
+- If "Planner change instruction" mentions a new destination: discard the existing results entirely
+  and generate fresh ACTIVITIES suited to the new destination, dates, travelers, and travel style.
+- If "Planner change instruction" mentions travel style, travelers, or dates changing (but destination
+  is unchanged): keep the same destination context, but re-filter/re-select ACTIVITIES to match the
+  new preference, moving anything now unsuitable into UNSUITABLE_ACTIVITIES with a brief reason.
+- If "Planner change instruction" is empty, this is a fresh planning call: generate ACTIVITIES and
+  UNSUITABLE_ACTIVITIES from scratch using the State above.
+- If "Planner change instruction" mentions something unrelated to destination/style/travelers/dates
+  (e.g. budget only): reuse the existing ACTIVITIES and UNSUITABLE_ACTIVITIES as-is, unchanged.
+- UNSUITABLE_ACTIVITIES must always include a short reason per item (e.g. "Scuba diving — unsuitable
+  for travelers with young children").
+"""
+    
     answer = call_llm(prompt)
 
     state["activities"] = get_list_value(answer, "ACTIVITIES")
@@ -463,6 +496,7 @@ Existing results: {state["results"]}
 # ==============================
 
 def infer_season_llm(state: GraphState) -> str:
+    
     prompt = f"""
 You are a Weather Season Detection Agent.
 
@@ -481,83 +515,98 @@ rainy
 spring
 autumn
 
+
+TOOL:
+
+Allowed values:
+yes
+no
+
 Trip details:
 Destination: {state["destination"]}
 Dates: {state["dates"]}
 Current season in state: {state["season"]}
 
+Planner change instruction (if any):
+{state.get("change", "")}
+
+Tool Details:
+- It returns temperature, weather, weather_risks
+
 Rules:
-- If Current season in state is already present, return that.
+- If "Planner change instruction" is non-empty and mentions destination, dates, or season,
+  IGNORE the current season in state and re-infer season fresh from the updated destination/dates.
+- If "Planner change instruction" is empty AND current season in state is already present, return that
+  existing season as-is (no need to re-infer).
 - If dates indicate June/July/August/September in India/Goa, prefer monsoon.
 - If you cannot infer season, return summer.
+- Set TOOL to yes whenever you return a season (new or existing), so the weather tool can be called
+  to fetch temperature/weather/weather_risks for it. Set TOOL to no only if season truly cannot be
+  determined even with fallback.
 """
-
+    
     answer = call_llm(prompt)
 
     season = get_value(answer, "SEASON").strip().lower()
+    
+    tool_required = get_value(answer, "TOOL").strip().lower()
 
     allowed = {"summer", "winter", "monsoon", "rainy", "spring", "autumn"}
+    
+    allowed_tool = {"yes","no"}
 
     if season not in allowed:
         season = "summer"
+    
+    if tool_required not in allowed_tool:
+        tool_required = "yes"
 
-    return season
+    return season , tool_required
+
+
+async def _fetch_weather_from_mcp(season: str) -> Dict[str, Any]:
+    async with streamable_http_client(
+        "http://localhost:9000/mcp"
+    ) as (read, write, get_session_id_callback):
+        async with ClientSession(read, write) as session:
+
+            await session.initialize()
+
+            result = await session.call_tool(
+                "get_weather",
+                {
+                    "season": season
+                },
+            )
+
+            print(result.content[0].text)
+
+            return json.loads(result.content[0].text)
 
 
 def weather_agent(state: GraphState):
     print(">> Weather Agent Running")
 
-    # Step 1: Weather LLM fills season before tool call
-    inferred_season = infer_season_llm(state)
+    inferred_season, tool_required = infer_season_llm(state)
 
     print("[Weather Agent] Inferred Season:", inferred_season)
 
-    # Update local state before tool call
-    state["season"] = inferred_season
+    data: Dict[str, Any] = {}
 
-    # Step 2: Gemini calls weather_api tool
-    prompt = f"""
-You are Weather and Seasonality Agent.
-
-You have access to the weather_api tool.
-
-Task:
-Use the weather_api tool to update these graph state fields:
-- season
-- weather
-- temperature
-- weather_risks
-
-Current state:
-Destination: {state["destination"]}
-Dates: {state["dates"]}
-Season: {state["season"]}
-Activities: {state["activities"]}
-
-Important:
-You must call the weather_api tool.
-Do not answer directly.
-"""
-
-    response = weather_llm.invoke([
-        HumanMessage(content=prompt)
-    ])
-
-    print("[Weather Agent Tool Calls]:", response.tool_calls)
+    if tool_required == "yes":
+        data = asyncio.run(_fetch_weather_from_mcp(inferred_season))
 
     return {
         "season": inferred_season,
-        "messages": [response],
-    }
-
-
-
-def weather_done_node(state: GraphState):
-    print(">> Weather Step Completed")
-
-    return {
+        "weather": data.get("weather") or state["weather"],
+        "temperature": data.get("temperature") or state["temperature"],
+        "weather_risks": data.get("weather_risks") or state["weather_risks"],
         "current_step": state["current_step"] + 1
+        
     }
+
+
+
 
 
 # ==============================
@@ -588,9 +637,26 @@ Destination: {state["destination"]}
 Duration days: {state["duration_days"]}
 Activities: {state["activities"]}
 Existing results: {state["results"]}
-"""
 
+Planner change instruction (if any):
+{state.get("change", "")}
+
+Rules:
+- If "Planner change instruction" is non-empty and relates to destination, source city, duration,
+  or activities: re-generate the full travel route and transport plan fresh, ignoring the existing
+  results above, since they are now outdated.
+- If "Planner change instruction" is non-empty but relates ONLY to something unrelated to transport
+  (e.g. budget amount, travel style preference not affecting distance), reuse the existing results
+  as-is and just repeat them in the output format, making no changes.
+- If "Planner change instruction" is empty, this is a fresh planning call: generate the route and
+  transport plan from scratch using the state above.
+- Always prioritize minimizing travel time and unnecessary transfers, while respecting duration days.
+"""
+    
     answer = call_llm(prompt)
+    
+    
+    print("Transport agent answer",answer)
 
     state["shortest_travel_route"] = get_value(answer, "SHORTEST_TRAVEL_ROUTE")
     state["local_transport_plan"] = get_value(answer, "LOCAL_TRANSPORT_PLAN")
@@ -635,8 +701,24 @@ Weather: {state["weather"]}
 Temperature: {state["temperature"]}
 Weather risks: {state["weather_risks"]}
 Existing results: {state["results"]}
-"""
 
+Planner change instruction (if any):
+{state.get("change", "")}
+
+Rules:
+- If "Planner change instruction" mentions a new budget amount: recompute BUDGET_STATUS against the
+  new figure using the existing ESTIMATED_COST if transport/destination/activities are unchanged;
+  otherwise recompute ESTIMATED_COST fully first.
+- If "Planner change instruction" mentions destination, transport, duration, travelers, or activities:
+  the cost basis has changed. Recompute ESTIMATED_COST fully from the current State above, ignoring
+  the old figures in "Existing results", then compare against Budget to set BUDGET_STATUS.
+- If "Planner change instruction" is empty, this is a fresh planning call: compute everything from
+  scratch using the State above.
+- BUDGET_STATUS must be one of: within budget / over budget / under budget.
+- If BUDGET_STATUS is "over budget", BUDGET_TRADEOFFS must suggest at least one concrete way to cut
+  cost (e.g. cheaper transport option, shorter duration, fewer paid activities).
+- If BUDGET_STATUS is not "over budget", BUDGET_TRADEOFFS may be left blank.
+"""
     answer = call_llm(prompt)
 
     parsed_budget = get_int_value(answer, "BUDGET")
@@ -715,8 +797,6 @@ builder = StateGraph(GraphState)
 builder.add_node("P", planner_node)
 builder.add_node("D", destination_agent)
 builder.add_node("W", weather_agent)
-builder.add_node("WEATHER_TOOL", ToolNode([weather_api]))
-builder.add_node("WEATHER_DONE", weather_done_node)
 builder.add_node("T", transport_agent)
 builder.add_node("B", budget_agent)
 builder.add_node("I", itinerary_agent)
@@ -749,20 +829,10 @@ builder.add_conditional_edges(
 
 builder.add_conditional_edges(
     "W",
-    route_after_weather_agent,
-    {
-        "WEATHER_TOOL": "WEATHER_TOOL",
-        END: END,
-    },
-)
-
-builder.add_edge("WEATHER_TOOL", "WEATHER_DONE")
-
-builder.add_conditional_edges(
-    "WEATHER_DONE",
     route_next,
     mapping,
 )
+
 
 builder.add_conditional_edges(
     "T",
@@ -795,7 +865,7 @@ graph = builder.compile(checkpointer=checkpointer)
 # ==============================
 
 
-def run_graph(state: GraphState, user_input: str, thread_id: str):
+async def run_graph(state: GraphState, user_input: str, thread_id: str):
     state["messages"].append(
         HumanMessage(content=user_input)
     )
@@ -811,13 +881,13 @@ def run_graph(state: GraphState, user_input: str, thread_id: str):
         "recursion_limit": 100,
     }
 
-    return graph.invoke(
+    return await graph.ainvoke(
         state,
         config=config,
     )
 
 
-def resume_graph(user_input: str, thread_id: str):
+async def resume_graph(user_input: str, thread_id: str):
     config = {
         "configurable": {
             "thread_id": thread_id
@@ -825,23 +895,17 @@ def resume_graph(user_input: str, thread_id: str):
         "recursion_limit": 100,
     }
 
-    return graph.invoke(
+    return await graph.ainvoke(
         Command(resume=user_input),
         config=config,
     )
 
 
-# ==============================
-# STREAMING RUN (for live "which agent is running" UI)
-# ==============================
 
-# Human-friendly labels for every node in the graph, keyed by node name.
 AGENT_LABELS: Dict[str, str] = {
     "P": "🧭 Planner Agent",
     "D": "🗺️ Destination & Experience Agent",
     "W": "🌦️ Weather & Seasonality Agent",
-    "WEATHER_TOOL": "🌦️ Weather Agent (fetching live weather data)",
-    "WEATHER_DONE": "🌦️ Weather & Seasonality Agent",
     "T": "🚗 Transport & Distance Agent",
     "B": "💰 Budget Agent",
     "I": "🧳 Itinerary Composer Agent",
@@ -957,4 +1021,6 @@ def get_initial_state() -> GraphState:
         "current_step": 0,
 
         "results": {},
+        
+        "change": ""
     }
