@@ -1,12 +1,7 @@
-
 import streamlit as st
 from uuid import uuid4
 
-from graph.graph_logic import (
-    get_initial_state,
-    stream_graph,
-    stream_resume_graph,
-)
+from stream_graph_logic.main import stream_graph,stream_resume_graph,get_initial_state
 
 # ==================================================
 # PAGE CONFIG
@@ -99,6 +94,36 @@ def render_interrupt(interrupt_data):
                     st.write(f"**{key.replace('_', ' ').title()}:** {value}")
 
     return interrupt_text
+
+
+def render_agent_summaries(summary: dict):
+    """
+    Displays each agent's SUMMARY field (state["summary"][agent_code])
+    as a clean bullet list instead of a raw dict dump.
+    """
+    if not summary:
+        return
+
+    labels = {
+        "D": "🗺️ Destination & Experience",
+        "W": "🌦️ Weather & Seasonality",
+        "T": "🚗 Transport & Distance",
+        "B": "💰 Budget",
+        "I": "🧳 Itinerary Composer",
+    }
+
+    for agent_code, points in summary.items():
+
+        if not points:
+            continue
+
+        st.markdown(f"**{labels.get(agent_code, agent_code)}**")
+
+        if isinstance(points, (list, tuple)):
+            for point in points:
+                st.markdown(f"- {point}")
+        else:
+            st.markdown(f"- {points}")
 
 
 # ==================================================
@@ -266,6 +291,10 @@ if user_input:
                 st.markdown("### ✈️ Final Itinerary")
                 st.markdown(itinerary)
 
+                if result.get("summary"):
+                    with st.expander("Agent Summaries"):
+                        render_agent_summaries(result.get("summary", {}))
+
                 st.session_state.chat_history.append(
                     {
                         "role": "assistant",
@@ -285,6 +314,10 @@ if user_input:
                     st.caption("Agents involved: " + " → ".join(agents_seen))
 
                 st.markdown(response)
+
+                if result.get("summary"):
+                    with st.expander("Agent Summaries"):
+                        render_agent_summaries(result.get("summary", {}))
 
                 st.session_state.chat_history.append(
                     {
